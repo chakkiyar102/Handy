@@ -36,7 +36,13 @@ pub enum EngineType {
     GigaAM,
     Canary,
     Cohere,
+    /// Apple SpeechAnalyzer (macOS 26+). Built into the OS: nothing to
+    /// download from Handy's side; the OS fetches per-locale assets on load.
+    AppleSpeech,
 }
+
+/// Registry id of the Apple SpeechAnalyzer entry.
+pub const APPLE_SPEECH_MODEL_ID: &str = "apple-speech-analyzer";
 
 /// Where a model comes from and how Handy obtains it — the routing discriminant
 /// for downloading and on-disk resolution.
@@ -1142,6 +1148,37 @@ impl ModelManager {
             },
         );
 
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if crate::apple_speech::is_available() {
+            available_models.insert(
+                APPLE_SPEECH_MODEL_ID.to_string(),
+                ModelInfo {
+                    id: APPLE_SPEECH_MODEL_ID.to_string(),
+                    name: "Apple Speech Analyzer".to_string(),
+                    description:
+                        "Next-generation on-device speech recognition. Requires macOS 26+."
+                            .to_string(),
+                    filename: String::new(),
+                    source: ModelSource::Local,
+                    size_mb: 0,
+                    is_downloaded: true,
+                    is_downloading: false,
+                    partial_size: 0,
+                    is_directory: false,
+                    engine_type: EngineType::AppleSpeech,
+                    accuracy_score: 0.80,
+                    speed_score: 0.95,
+                    supports_translation: false,
+                    is_recommended: false,
+                    supported_languages: crate::apple_speech::supported_languages(),
+                    supports_language_selection: true,
+                    is_custom: false,
+                    supports_streaming: false,
+                    supports_language_detection: false,
+                },
+            );
+        }
+
         // Seed the bundled offline catalog before the on-disk scans, so a model
         // already in the HF cache dedups onto its richer catalog entry (the scans
         // only insert ids not already present) instead of showing as a bare cache
@@ -1407,6 +1444,10 @@ impl ModelManager {
         let mut vanished_models: Vec<String> = Vec::new();
 
         for model in models.values_mut() {
+            // Built into the OS; there is no file to check.
+            if matches!(model.engine_type, EngineType::AppleSpeech) {
+                continue;
+            }
             if let ModelSource::HuggingFace { repo_id, revision } = &model.source {
                 // A models-dir copy counts too: mirror-fallback downloads land
                 // there, and it makes manual drop-ins of catalog files work.
@@ -2430,6 +2471,10 @@ impl ModelManager {
 
         debug!("ModelManager: Found model info: {:?}", model_info);
 
+        if matches!(model_info.engine_type, EngineType::AppleSpeech) {
+            return Err(anyhow::anyhow!("Apple Speech is built into macOS"));
+        }
+
         if let ModelSource::HuggingFace { repo_id, revision } = &model_info.source {
             let is_alternate_quant =
                 Self::is_catalog_alternate_quant(repo_id, &model_info.filename);
@@ -2598,6 +2643,11 @@ impl ModelManager {
                 "Model is currently downloading: {}",
                 model_id
             ));
+        }
+
+        // No file on disk; the engine is addressed by locale, not path.
+        if matches!(model_info.engine_type, EngineType::AppleSpeech) {
+            return Ok(PathBuf::new());
         }
 
         if let ModelSource::HuggingFace { repo_id, revision } = &model_info.source {

@@ -191,6 +191,9 @@ enum OnnxEngine {
     GigaAM(GigaAMModel),
     Canary(CanaryModel),
     Cohere(CohereModel),
+    /// Apple SpeechAnalyzer; stateless on our side (the OS owns the model).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    AppleSpeech,
 }
 
 /// RAII guard that clears the `is_loading` flag and notifies waiters on drop.
@@ -740,6 +743,27 @@ impl TranscriptionManager {
                     anyhow::anyhow!(error_msg)
                 })?;
                 Some(OnnxEngine::Cohere(engine))
+            }
+            EngineType::AppleSpeech => {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    // Install the locale's on-device assets now (first use
+                    // downloads them) so the first dictation isn't slowed down.
+                    let language = get_settings(&self.app_handle).selected_language;
+                    let locale = crate::apple_speech::prepare(&language).map_err(|e| {
+                        let error_msg = format!("Failed to prepare Apple Speech: {}", e);
+                        emit_loading_failed(&error_msg);
+                        anyhow::anyhow!(error_msg)
+                    })?;
+                    info!("Apple Speech ready for locale {}", locale);
+                    Some(OnnxEngine::AppleSpeech)
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
+                    let error_msg = "Apple Speech is only available on Apple Silicon Macs";
+                    emit_loading_failed(error_msg);
+                    return Err(anyhow::anyhow!(error_msg));
+                }
             }
         };
 
@@ -1452,6 +1476,12 @@ impl TranscriptionManager {
                         .transcribe(audio, &options)
                         .map(|r| r.text)
                         .map_err(|e| anyhow::anyhow!("Cohere transcription failed: {}", e))
+                }
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                OnnxEngine::AppleSpeech => {
+                    applied_language_hint = Some(validated_language.to_string());
+                    crate::apple_speech::transcribe(audio, validated_language)
+                        .map_err(|e| anyhow::anyhow!("Apple Speech transcription failed: {}", e))
                 }
             }
         }));

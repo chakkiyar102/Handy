@@ -1,6 +1,8 @@
 fn main() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     build_apple_intelligence_bridge();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    build_apple_speech_bridge();
 
     generate_tray_translations();
 
@@ -560,6 +562,111 @@ fn build_apple_intelligence_bridge() {
     }
 
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+}
+
+/// Compile the Apple SpeechAnalyzer bridge (macOS 26+ on-device speech
+/// recognition) into a static lib. Unlike FoundationModels it needs no Swift
+/// macros, so the Command Line Tools toolchain is enough. SDKs that predate
+/// SpeechAnalyzer get the stub, which reports the engine as unavailable.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn build_apple_speech_bridge() {
+    use std::env;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const REAL_SWIFT_FILE: &str = "swift/apple_speech.swift";
+    const STUB_SWIFT_FILE: &str = "swift/apple_speech_stub.swift";
+    const BRIDGE_HEADER: &str = "swift/apple_speech_bridge.h";
+
+    println!("cargo:rerun-if-changed={REAL_SWIFT_FILE}");
+    println!("cargo:rerun-if-changed={STUB_SWIFT_FILE}");
+    println!("cargo:rerun-if-changed={BRIDGE_HEADER}");
+    println!("cargo:rerun-if-env-changed=HANDY_FORCE_SPEECH_STUB");
+
+    let xcrun = |args: &[&str]| {
+        let out = Command::new("xcrun")
+            .args(args)
+            .output()
+            .expect("Failed to run xcrun");
+        String::from_utf8(out.stdout)
+            .expect("xcrun output is not valid UTF-8")
+            .trim()
+            .to_string()
+    };
+    let sdk_path =
+        env::var("SDKROOT").unwrap_or_else(|_| xcrun(&["--sdk", "macosx", "--show-sdk-path"]));
+    let swiftc_path = env::var("SWIFTC").unwrap_or_else(|_| xcrun(&["--find", "swiftc"]));
+
+    let interface = Path::new(&sdk_path).join(
+        "System/Library/Frameworks/Speech.framework/Modules/Speech.swiftmodule/arm64e-apple-macos.swiftinterface",
+    );
+    let has_speech_analyzer = std::fs::read_to_string(&interface)
+        .map(|s| s.contains("actor SpeechAnalyzer"))
+        .unwrap_or(false)
+        && env::var("HANDY_FORCE_SPEECH_STUB").as_deref() != Ok("1");
+    let source_file = if has_speech_analyzer {
+        REAL_SWIFT_FILE
+    } else {
+        println!("cargo:warning=SpeechAnalyzer not in SDK. Building Apple Speech with stubs.");
+        STUB_SWIFT_FILE
+    };
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let object_path = out_dir.join("apple_speech.o");
+    let static_lib_path = out_dir.join("libapple_speech.a");
+
+    // Same flags and rationale as the Apple Intelligence bridge above.
+    let status = Command::new(&swiftc_path)
+        .args([
+            "-parse-as-library",
+            "-target",
+            "arm64-apple-macosx11.0",
+            "-sdk",
+        ])
+        .arg(&sdk_path)
+        .args([
+            "-O",
+            "-import-objc-header",
+            BRIDGE_HEADER,
+            "-c",
+            source_file,
+            "-o",
+        ])
+        .arg(&object_path)
+        .status()
+        .expect("Failed to invoke swiftc for Apple Speech bridge");
+    if !status.success() {
+        panic!("swiftc failed to compile {source_file}");
+    }
+
+    let status = Command::new("libtool")
+        .arg("-static")
+        .arg("-o")
+        .arg(&static_lib_path)
+        .arg(&object_path)
+        .status()
+        .expect("Failed to create static library for Apple Speech bridge");
+    if !status.success() {
+        panic!("libtool failed for Apple Speech bridge");
+    }
+
+    let toolchain_swift_lib = Path::new(&swiftc_path)
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join("lib/swift/macosx"))
+        .expect("Unable to determine Swift toolchain lib directory");
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=apple_speech");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        toolchain_swift_lib.display()
+    );
+    println!("cargo:rustc-link-lib=framework=AVFoundation");
+    // Speech exists since 10.15 but weak-link it anyway; the SpeechAnalyzer
+    // symbols themselves are weak via the Swift @available checks.
+    println!("cargo:rustc-link-arg=-weak_framework");
+    println!("cargo:rustc-link-arg=Speech");
 }
 
 /// Returns true when the active developer directory is the standalone Command
