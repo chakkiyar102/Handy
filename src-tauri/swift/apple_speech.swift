@@ -220,7 +220,23 @@ private func transcribe(
         collector.cancel()
         throw error
     }
-    return try await collector.value.trimmingCharacters(in: .whitespacesAndNewlines)
+    let text = try await collector.value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return finishSentence(text, locale: transcriber.selectedLocales.first)
+}
+
+/// Dictation drops the final full stop when an utterance ends without a strong
+/// sentence cue. Add one to the final text if it ends mid-word and reads like a
+/// sentence. Languages with their own (or no) sentence terminator are left alone.
+// ponytail: naive heuristic (>= 4 words, ends in a letter/digit); tune the
+// threshold or the language list if it misfires on short commands.
+@available(macOS 26.0, *)
+private func finishSentence(_ text: String, locale: Locale?) -> String {
+    let skipped: Set<String> = ["zh", "yue", "ja", "th", "hi"]
+    guard let last = text.last, last.isLetter || last.isNumber,
+        text.split(whereSeparator: \.isWhitespace).count >= 4,
+        !skipped.contains(locale.flatMap(baseCode) ?? "")
+    else { return text }
+    return text + "."
 }
 
 /// A fresh analyzer per utterance: reused ones carry context across utterances
@@ -255,16 +271,19 @@ private func prime(_ analyzer: SpeechAnalyzer, format: AVAudioFormat, contextWor
 @available(macOS 26.0, *)
 private final class StreamSession: @unchecked Sendable {
     let analyzer: SpeechAnalyzer
+    let locale: Locale?
     let continuation: AsyncStream<AnalyzerInput>.Continuation
     let inputFormat: AVAudioFormat
     let targetFormat: AVAudioFormat
     var collector: Task<String, Error>!
 
     init(
-        analyzer: SpeechAnalyzer, continuation: AsyncStream<AnalyzerInput>.Continuation,
+        analyzer: SpeechAnalyzer, locale: Locale?,
+        continuation: AsyncStream<AnalyzerInput>.Continuation,
         inputFormat: AVAudioFormat, targetFormat: AVAudioFormat
     ) {
         self.analyzer = analyzer
+        self.locale = locale
         self.continuation = continuation
         self.inputFormat = inputFormat
         self.targetFormat = targetFormat
@@ -306,8 +325,8 @@ private func startStream(
 
     let (stream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
     let session = StreamSession(
-        analyzer: analyzer, continuation: continuation, inputFormat: inputFormat,
-        targetFormat: targetFormat)
+        analyzer: analyzer, locale: transcriber.selectedLocales.first,
+        continuation: continuation, inputFormat: inputFormat, targetFormat: targetFormat)
     // Dictation volatiles are cumulative within a segment, so committed is the
     // finals so far and tentative the latest volatile.
     session.collector = Task {
@@ -438,7 +457,9 @@ public func appleSpeechStreamFinish(_ session: UnsafeMutableRawPointer)
             session.collector.cancel()
             throw error
         }
-        return try await session.collector.value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = try await session.collector.value.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        return finishSentence(text, locale: session.locale)
     })
 }
 
