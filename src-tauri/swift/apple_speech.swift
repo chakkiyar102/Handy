@@ -121,7 +121,10 @@ private func ensureAssets(_ transcriber: Transcriber, locale: Locale) async thro
 }
 
 @available(macOS 26.0, *)
-private func prepareTranscriber(_ code: String) async throws -> Transcriber {
+private func prepareTranscriber(
+    _ code: String,
+    reporting: Set<Transcriber.ReportingOption> = [.frequentFinalization]
+) async throws -> Transcriber {
     guard let locale = await resolveLocale(code) else {
         throw BridgeError(message: "Apple Speech does not support language '\(code)'")
     }
@@ -129,7 +132,7 @@ private func prepareTranscriber(_ code: String) async throws -> Transcriber {
     // back final instead of as a lone volatile result.
     let transcriber = Transcriber(
         locale: locale, contentHints: [.shortForm], transcriptionOptions: [.punctuation],
-        reportingOptions: [.frequentFinalization], attributeOptions: [])
+        reportingOptions: reporting, attributeOptions: [])
     try await ensureAssets(transcriber, locale: locale)
     return transcriber
 }
@@ -208,21 +211,9 @@ private func transcribe(
     continuation.yield(AnalyzerInput(buffer: buffer))
     continuation.finish()
 
-    // A fresh analyzer per utterance: reused ones carry context across
-    // utterances and finished ones fail silently. `.lingering` keeps the model
-    // in memory between calls, so setup stays ~50-130 ms.
-    let analyzer = SpeechAnalyzer(
-        modules: [transcriber],
-        options: .init(priority: .userInitiated, modelRetention: .lingering))
+    let analyzer = makeAnalyzer(transcriber)
     do {
-        try await analyzer.prepareToAnalyze(in: targetFormat)
-        // Biases recognition toward the user's custom words (DictationTranscriber
-        // only; Apple caps it at ~100 short phrases).
-        if !contextWords.isEmpty {
-            let context = AnalysisContext()
-            context.contextualStrings[.general] = Array(contextWords.prefix(100))
-            try await analyzer.setContext(context)
-        }
+        try await prime(analyzer, format: targetFormat, contextWords: contextWords)
         try await analyzer.start(inputSequence: stream)
         try await analyzer.finalizeAndFinishThroughEndOfInput()
     } catch {
@@ -230,6 +221,111 @@ private func transcribe(
         throw error
     }
     return try await collector.value.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// A fresh analyzer per utterance: reused ones carry context across utterances
+/// and finished ones fail silently. `.lingering` keeps the model in memory
+/// between calls, so setup stays ~50-130 ms.
+@available(macOS 26.0, *)
+private func makeAnalyzer(_ transcriber: Transcriber) -> SpeechAnalyzer {
+    SpeechAnalyzer(
+        modules: [transcriber],
+        options: .init(priority: .userInitiated, modelRetention: .lingering))
+}
+
+@available(macOS 26.0, *)
+private func prime(_ analyzer: SpeechAnalyzer, format: AVAudioFormat, contextWords: [String])
+    async throws
+{
+    try await analyzer.prepareToAnalyze(in: format)
+    // Biases recognition toward the user's custom words (DictationTranscriber
+    // only; Apple caps it at ~100 short phrases).
+    if !contextWords.isEmpty {
+        let context = AnalysisContext()
+        context.contextualStrings[.general] = Array(contextWords.prefix(100))
+        try await analyzer.setContext(context)
+    }
+}
+
+// MARK: - Live streaming
+
+/// One push-to-talk utterance streamed frame by frame. Results are pushed to
+/// the C callback as (committed, tentative) text; no callback fires after
+/// `finish` or `cancel` returns.
+@available(macOS 26.0, *)
+private final class StreamSession: @unchecked Sendable {
+    let analyzer: SpeechAnalyzer
+    let continuation: AsyncStream<AnalyzerInput>.Continuation
+    let inputFormat: AVAudioFormat
+    let targetFormat: AVAudioFormat
+    var collector: Task<String, Error>!
+
+    init(
+        analyzer: SpeechAnalyzer, continuation: AsyncStream<AnalyzerInput>.Continuation,
+        inputFormat: AVAudioFormat, targetFormat: AVAudioFormat
+    ) {
+        self.analyzer = analyzer
+        self.continuation = continuation
+        self.inputFormat = inputFormat
+        self.targetFormat = targetFormat
+    }
+
+    func feed(_ samples: UnsafeBufferPointer<Float>) {
+        guard let base = samples.baseAddress, samples.count > 0,
+            let input = AVAudioPCMBuffer(
+                pcmFormat: inputFormat, frameCapacity: AVAudioFrameCount(samples.count))
+        else { return }
+        input.frameLength = AVAudioFrameCount(samples.count)
+        input.floatChannelData![0].update(from: base, count: samples.count)
+        if let buffer = try? convert(input, to: targetFormat) {
+            continuation.yield(AnalyzerInput(buffer: buffer))
+        }
+    }
+}
+
+public typealias AppleSpeechTextCallback = @convention(c) (
+    UnsafeMutableRawPointer?, UnsafePointer<CChar>, UnsafePointer<CChar>
+) -> Void
+
+@available(macOS 26.0, *)
+private func startStream(
+    code: String, contextWords: [String], callback: AppleSpeechTextCallback,
+    user: UnsafeMutableRawPointer?
+) async throws -> StreamSession {
+    let transcriber = try await prepareTranscriber(
+        code, reporting: [.volatileResults, .frequentFinalization])
+    guard
+        let inputFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)
+    else { throw BridgeError(message: "Failed to create audio format") }
+    let targetFormat =
+        await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) ?? inputFormat
+
+    let analyzer = makeAnalyzer(transcriber)
+    try await prime(analyzer, format: targetFormat, contextWords: contextWords)
+
+    let (stream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
+    let session = StreamSession(
+        analyzer: analyzer, continuation: continuation, inputFormat: inputFormat,
+        targetFormat: targetFormat)
+    // Dictation volatiles are cumulative within a segment, so committed is the
+    // finals so far and tentative the latest volatile.
+    session.collector = Task {
+        var finalized = ""
+        var pending = ""
+        for try await result in transcriber.results {
+            if result.isFinal {
+                finalized += String(result.text.characters)
+                pending = ""
+            } else {
+                pending = String(result.text.characters)
+            }
+            finalized.withCString { c in pending.withCString { t in callback(user, c, t) } }
+        }
+        return finalized + pending
+    }
+    try await analyzer.start(inputSequence: stream)
+    return session
 }
 
 // MARK: - C entry points
@@ -285,6 +381,77 @@ public func appleSpeechTranscribe(
     return makeResponse(blocking {
         try await transcribe(copy, sampleRate: Double(sampleRate), code: code, contextWords: words)
     })
+}
+
+@_cdecl("apple_speech_stream_start")
+public func appleSpeechStreamStart(
+    _ language: UnsafePointer<CChar>,
+    _ contextWords: UnsafePointer<CChar>,
+    _ callback: AppleSpeechTextCallback,
+    _ user: UnsafeMutableRawPointer?,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> UnsafeMutableRawPointer? {
+    let code = String(cString: language)
+    let words = String(cString: contextWords).split(separator: "\n").map(String.init)
+    guard #available(macOS 26.0, *) else {
+        errorOut.pointee = strdup("Apple Speech requires macOS 26 or later")
+        return nil
+    }
+    // The raw pointer only crosses into the Task; Rust keeps it alive until
+    // finish/cancel returns.
+    let userBits = Int(bitPattern: user)
+    switch blocking({
+        try await startStream(
+            code: code, contextWords: words, callback: callback,
+            user: UnsafeMutableRawPointer(bitPattern: userBits))
+    }) {
+    case .success(let session):
+        return Unmanaged.passRetained(session).toOpaque()
+    case .failure(let error):
+        errorOut.pointee = strdup(error.localizedDescription)
+        return nil
+    }
+}
+
+@_cdecl("apple_speech_stream_feed")
+public func appleSpeechStreamFeed(
+    _ session: UnsafeMutableRawPointer, _ samples: UnsafePointer<Float>?, _ count: Int
+) {
+    guard #available(macOS 26.0, *), let samples else { return }
+    let session = Unmanaged<StreamSession>.fromOpaque(session).takeUnretainedValue()
+    session.feed(UnsafeBufferPointer(start: samples, count: count))
+}
+
+@_cdecl("apple_speech_stream_finish")
+public func appleSpeechStreamFinish(_ session: UnsafeMutableRawPointer)
+    -> UnsafeMutablePointer<AppleSpeechResponse>
+{
+    guard #available(macOS 26.0, *) else {
+        return makeResponse(.failure(BridgeError(message: "Apple Speech requires macOS 26 or later")))
+    }
+    let session = Unmanaged<StreamSession>.fromOpaque(session).takeRetainedValue()
+    return makeResponse(blocking {
+        session.continuation.finish()
+        do {
+            try await session.analyzer.finalizeAndFinishThroughEndOfInput()
+        } catch {
+            session.collector.cancel()
+            throw error
+        }
+        return try await session.collector.value.trimmingCharacters(in: .whitespacesAndNewlines)
+    })
+}
+
+@_cdecl("apple_speech_stream_cancel")
+public func appleSpeechStreamCancel(_ session: UnsafeMutableRawPointer) {
+    guard #available(macOS 26.0, *) else { return }
+    let session = Unmanaged<StreamSession>.fromOpaque(session).takeRetainedValue()
+    _ = blocking {
+        session.continuation.finish()
+        await session.analyzer.cancelAndFinishNow()
+        // Wait out the collector so no callback can fire after we return.
+        _ = try? await session.collector.value
+    }
 }
 
 @_cdecl("apple_speech_free_response")

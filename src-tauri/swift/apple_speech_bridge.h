@@ -30,6 +30,16 @@ AppleSpeechResponse* apple_speech_prepare(const char* language);
 // `context_words` is a newline-separated list of custom words to bias toward.
 AppleSpeechResponse* apple_speech_transcribe(const float* samples, size_t count, int sample_rate, const char* language, const char* context_words);
 
+// Live streaming. `callback` receives (user, committed, tentative) on a
+// background thread for every result; it never fires after finish/cancel
+// returns. start returns NULL and sets *error_out (free with
+// apple_speech_free_string) on failure. finish and cancel free the session.
+typedef void (*AppleSpeechTextCallback)(void* user, const char* committed, const char* tentative);
+void* apple_speech_stream_start(const char* language, const char* context_words, AppleSpeechTextCallback callback, void* user, char** error_out);
+void apple_speech_stream_feed(void* session, const float* samples, size_t count);
+AppleSpeechResponse* apple_speech_stream_finish(void* session);
+void apple_speech_stream_cancel(void* session);
+
 void apple_speech_free_response(AppleSpeechResponse* response);
 void apple_speech_free_string(char* value);
 

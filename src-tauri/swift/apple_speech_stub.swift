@@ -37,6 +37,37 @@ public func appleSpeechTranscribe(
     return unavailable()
 }
 
+public typealias AppleSpeechTextCallback = @convention(c) (
+    UnsafeMutableRawPointer?, UnsafePointer<CChar>, UnsafePointer<CChar>
+) -> Void
+
+@_cdecl("apple_speech_stream_start")
+public func appleSpeechStreamStart(
+    _ language: UnsafePointer<CChar>,
+    _ contextWords: UnsafePointer<CChar>,
+    _ callback: AppleSpeechTextCallback,
+    _ user: UnsafeMutableRawPointer?,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> UnsafeMutableRawPointer? {
+    errorOut.pointee = strdup("Apple Speech is not available in this build (SDK requirement not met).")
+    return nil
+}
+
+@_cdecl("apple_speech_stream_feed")
+public func appleSpeechStreamFeed(
+    _ session: UnsafeMutableRawPointer, _ samples: UnsafePointer<Float>?, _ count: Int
+) {}
+
+@_cdecl("apple_speech_stream_finish")
+public func appleSpeechStreamFinish(_ session: UnsafeMutableRawPointer)
+    -> UnsafeMutablePointer<AppleSpeechResponse>
+{
+    return unavailable()
+}
+
+@_cdecl("apple_speech_stream_cancel")
+public func appleSpeechStreamCancel(_ session: UnsafeMutableRawPointer) {}
+
 @_cdecl("apple_speech_free_response")
 public func appleSpeechFreeResponse(_ response: UnsafeMutablePointer<AppleSpeechResponse>?) {
     guard let response else { return }

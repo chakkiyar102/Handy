@@ -904,6 +904,12 @@ impl TranscriptionManager {
 
         let model_id = self.get_current_model().unwrap_or_default();
 
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if matches!(*self.lock_onnx(), Some(OnnxEngine::AppleSpeech)) {
+            self.run_apple_stream(rx, &model_id);
+            return;
+        }
+
         // Only transcribe-cpp models expose streaming; ONNX engines fall back to
         // batch. The loaded model (not the ModelManager copy) is the source of
         // truth for run-path capabilities.
@@ -1070,6 +1076,71 @@ impl TranscriptionManager {
         // The channel closed without finalize/cancel; dropping the stream
         // handle resets the worker's stream. `_worker` drops after, clearing
         // this worker's flags.
+    }
+
+    /// Apple SpeechAnalyzer streaming: the OS emits volatile/final results that
+    /// map straight onto the overlay's committed/tentative text. Any failure
+    /// reports `None` so the caller falls back to batch transcription.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn run_apple_stream(&self, rx: mpsc::Receiver<StreamCmd>, model_id: &str) {
+        let settings = get_settings(&self.app_handle);
+        let language =
+            effective_language_for_model(&settings, self.model_manager.as_ref(), model_id);
+        let languages = self
+            .model_manager
+            .get_model_info(model_id)
+            .map(|info| info.supported_languages)
+            .unwrap_or_default();
+        let output_language =
+            resolve_output_language_evidence(&settings, Some(&language), &languages, false);
+
+        let app_handle = self.app_handle.clone();
+        let stream = match crate::apple_speech::Stream::start(
+            &language,
+            &settings.custom_words,
+            move |committed, tentative| emit_stream_text(&app_handle, committed, tentative),
+        ) {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("Failed to begin Apple Speech stream: {}", e);
+                self.router.clear();
+                drain_until_finalize(rx);
+                return;
+            }
+        };
+
+        self.stream_active.store(true, Ordering::Release);
+        self.touch_activity();
+        info!(
+            "Live streaming transcription started (Apple Speech, {})",
+            language
+        );
+
+        while let Ok(cmd) = rx.recv() {
+            match cmd {
+                StreamCmd::Feed(pcm) => {
+                    self.touch_activity();
+                    stream.feed(&pcm);
+                }
+                StreamCmd::Finalize(reply) => {
+                    let result = match stream.finish() {
+                        Ok(text) => Some(FinalizedStreamText {
+                            text,
+                            output_language,
+                            supported_languages: languages,
+                        }),
+                        Err(e) => {
+                            error!("Apple Speech stream failed: {}; falling back to batch", e);
+                            None
+                        }
+                    };
+                    let _ = reply.send(Ok(result));
+                    return;
+                }
+                // Dropping the stream cancels it.
+                StreamCmd::Cancel => return,
+            }
+        }
     }
 
     /// Return the taken ONNX engine to the mutex, unless the model was switched

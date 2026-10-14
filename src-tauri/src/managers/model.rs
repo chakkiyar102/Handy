@@ -1173,7 +1173,7 @@ impl ModelManager {
                     supported_languages: crate::apple_speech::supported_languages(),
                     supports_language_selection: true,
                     is_custom: false,
-                    supports_streaming: false,
+                    supports_streaming: true,
                     supports_language_detection: false,
                 },
             );
