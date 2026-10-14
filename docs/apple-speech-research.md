@@ -180,6 +180,7 @@ Evidence:
   - "parakeet and moonshine with whisper.CPP" became "**Parakeet and Moonshine with whisper.cpp**".
   - Unchanged: "Abraham" (Abhiram) and "paying person about to" (ping Dharsan about Tauri).
   - Passing context at init (`SpeechAnalyzer(inputSequence:modules:analysisContext:)`) and calling `setContext(_:)` before `start` gave identical results.
+- **Follow-up after implementation [verified]:** the bias depends on both the clip and the locale. "We moved the Kissflow dictation … whisper dot cpp" was fixed under en-US but unchanged under en-IN, in both the research harness and the bridge. Through the shipped bridge (en-IN), v1/v2 still gained "Kissflow", "Parakeet" and "whisper.cpp". So treat it as a soft hint and keep the fuzzy post-pass.
 - **SpeechTranscriber [verified]:** the same strings changed nothing ("Kiss Flow", "parakeet", "Abiram").
 - **[doc]** `contextualStrings`:
   - "With the DictationTranscriber module, you can use this property to specify short custom phrases … Keep phrases relatively brief, limiting them to one or two words … Limit the total number of phrases across all tags to no more than 100."

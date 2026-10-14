@@ -1480,8 +1480,12 @@ impl TranscriptionManager {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 OnnxEngine::AppleSpeech => {
                     applied_language_hint = Some(validated_language.to_string());
-                    crate::apple_speech::transcribe(audio, validated_language)
-                        .map_err(|e| anyhow::anyhow!("Apple Speech transcription failed: {}", e))
+                    crate::apple_speech::transcribe(
+                        audio,
+                        validated_language,
+                        &settings.custom_words,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Apple Speech transcription failed: {}", e))
                 }
             }
         }));

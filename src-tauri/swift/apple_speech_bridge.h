@@ -27,7 +27,8 @@ char* apple_speech_supported_languages(void);
 AppleSpeechResponse* apple_speech_prepare(const char* language);
 
 // Transcribe mono float samples in [-1, 1] at `sample_rate`. Blocks until done.
-AppleSpeechResponse* apple_speech_transcribe(const float* samples, size_t count, int sample_rate, const char* language);
+// `context_words` is a newline-separated list of custom words to bias toward.
+AppleSpeechResponse* apple_speech_transcribe(const float* samples, size_t count, int sample_rate, const char* language, const char* context_words);
 
 void apple_speech_free_response(AppleSpeechResponse* response);
 void apple_speech_free_string(char* value);

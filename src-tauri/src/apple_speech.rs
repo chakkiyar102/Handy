@@ -20,6 +20,7 @@ extern "C" {
         count: usize,
         sample_rate: c_int,
         language: *const c_char,
+        context_words: *const c_char,
     ) -> *mut AppleSpeechResponse;
     fn apple_speech_free_response(response: *mut AppleSpeechResponse);
     fn apple_speech_free_string(value: *mut c_char);
@@ -69,11 +70,22 @@ pub fn prepare(language: &str) -> Result<String, String> {
     take_response(unsafe { apple_speech_prepare(language.as_ptr()) })
 }
 
-/// Transcribe 16 kHz mono samples.
-pub fn transcribe(audio: &[f32], language: &str) -> Result<String, String> {
+/// Transcribe 16 kHz mono samples, biasing recognition toward `custom_words`.
+pub fn transcribe(
+    audio: &[f32],
+    language: &str,
+    custom_words: &[String],
+) -> Result<String, String> {
     let language = CString::new(language).map_err(|e| e.to_string())?;
+    let words = CString::new(custom_words.join("\n")).map_err(|e| e.to_string())?;
     take_response(unsafe {
-        apple_speech_transcribe(audio.as_ptr(), audio.len(), 16_000, language.as_ptr())
+        apple_speech_transcribe(
+            audio.as_ptr(),
+            audio.len(),
+            16_000,
+            language.as_ptr(),
+            words.as_ptr(),
+        )
     })
 }
 
@@ -88,6 +100,6 @@ mod tests {
             return;
         }
         assert!(supported_languages().iter().any(|l| l == "en"));
-        assert_eq!(transcribe(&vec![0.0; 16_000], "en").unwrap(), "");
+        assert_eq!(transcribe(&vec![0.0; 16_000], "en", &[]).unwrap(), "");
     }
 }

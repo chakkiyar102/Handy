@@ -59,32 +59,65 @@ private func baseCode(_ locale: Locale) -> String? {
 
 /// Map a Handy language code to a supported transcriber locale. A bare code
 /// ("en") prefers the user's own region (en-IN for an Indian system locale),
-/// then whatever the framework considers equivalent.
+/// then whatever the framework considers equivalent. `supportedLocale(equivalentTo:)`
+/// can return locales the transcriber does not actually support (e.g. "hi" ->
+/// hi-IN on SpeechTranscriber), so every candidate is checked against
+/// `supportedLocales`.
 @available(macOS 26.0, *)
 private func resolveLocale(_ code: String) async -> Locale? {
     let current = Locale.current
     let wanted = (code.isEmpty || code == "auto") ? (baseCode(current) ?? "en") : code
     let supported = await Transcriber.supportedLocales
     let bcp47 = { (l: Locale) in l.identifier(.bcp47).lowercased() }
+    let lookup = { (id: String) in supported.first(where: { bcp47($0) == id.lowercased() }) }
 
-    if wanted.contains("-") || wanted.contains("_") {
-        let requested = Locale(identifier: wanted)
-        if let match = supported.first(where: { bcp47($0) == bcp47(requested) }) {
+    let requested = Locale(identifier: wanted)
+    var candidates = [requested.identifier(.bcp47)]
+    if !(wanted.contains("-") || wanted.contains("_")), let region = current.region?.identifier {
+        candidates.insert("\(wanted)-\(region)", at: 0)
+    }
+    // It can also hop languages ("yue" -> zh-HK), so only take same-language picks.
+    if let equivalent = await Transcriber.supportedLocale(equivalentTo: requested),
+        baseCode(equivalent) == baseCode(requested)
+    {
+        candidates.append(equivalent.identifier(.bcp47))
+    }
+    for id in candidates {
+        if let match = lookup(id) {
             return match
         }
-        return await Transcriber.supportedLocale(equivalentTo: requested)
     }
+    return supported.first(where: { baseCode($0) == baseCode(requested) })
+}
 
-    if let region = current.region?.identifier {
-        let regional = "\(wanted)-\(region)".lowercased()
-        if let match = supported.first(where: { bcp47($0) == regional }) {
-            return match
+/// Install the locale's assets if needed. Installing reserves the locale, and
+/// only `maximumReservedLocales` (5 on an M1) may be reserved at once, so on
+/// failure release the oldest other reservation and retry once.
+@available(macOS 26.0, *)
+private func ensureAssets(_ transcriber: Transcriber, locale: Locale) async throws {
+    switch await AssetInventory.status(forModules: [transcriber]) {
+    case .installed:
+        return
+    case .unsupported:
+        throw BridgeError(message: "Apple Speech does not support \(locale.identifier(.bcp47))")
+    default:
+        break
+    }
+    let install = {
+        if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+            try await request.downloadAndInstall()
         }
     }
-    if let match = await Transcriber.supportedLocale(equivalentTo: Locale(identifier: wanted)) {
-        return match
+    do {
+        try await install()
+    } catch {
+        let reserved = await AssetInventory.reservedLocales
+        guard reserved.count >= AssetInventory.maximumReservedLocales,
+            let oldest = reserved.first(where: { $0 != locale })
+        else { throw error }
+        _ = await AssetInventory.release(reservedLocale: oldest)
+        try await install()
     }
-    return supported.first(where: { baseCode($0) == wanted })
 }
 
 @available(macOS 26.0, *)
@@ -92,10 +125,12 @@ private func prepareTranscriber(_ code: String) async throws -> Transcriber {
     guard let locale = await resolveLocale(code) else {
         throw BridgeError(message: "Apple Speech does not support language '\(code)'")
     }
-    let transcriber = Transcriber(locale: locale, preset: .shortDictation)
-    if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-        try await request.downloadAndInstall()
-    }
+    // .shortDictation plus frequentFinalization: same text, but results come
+    // back final instead of as a lone volatile result.
+    let transcriber = Transcriber(
+        locale: locale, contentHints: [.shortForm], transcriptionOptions: [.punctuation],
+        reportingOptions: [.frequentFinalization], attributeOptions: [])
+    try await ensureAssets(transcriber, locale: locale)
     return transcriber
 }
 
@@ -130,7 +165,9 @@ private func convert(_ buffer: AVAudioPCMBuffer, to format: AVAudioFormat) throw
 }
 
 @available(macOS 26.0, *)
-private func transcribe(_ samples: [Float], sampleRate: Double, code: String) async throws -> String {
+private func transcribe(
+    _ samples: [Float], sampleRate: Double, code: String, contextWords: [String]
+) async throws -> String {
     let transcriber = try await prepareTranscriber(code)
 
     guard
@@ -151,8 +188,8 @@ private func transcribe(_ samples: [Float], sampleRate: Double, code: String) as
         await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) ?? inputFormat
     let buffer = try convert(input, to: targetFormat)
 
-    // Short dictation presets can end on a volatile result that is never
-    // promoted to final, so keep the trailing volatile text too.
+    // Undocumented: short-form dictation can end on a volatile result that is
+    // never promoted to final, so keep the trailing volatile text too.
     let collector = Task {
         var finalized = ""
         var pending = ""
@@ -171,8 +208,21 @@ private func transcribe(_ samples: [Float], sampleRate: Double, code: String) as
     continuation.yield(AnalyzerInput(buffer: buffer))
     continuation.finish()
 
-    let analyzer = SpeechAnalyzer(modules: [transcriber])
+    // A fresh analyzer per utterance: reused ones carry context across
+    // utterances and finished ones fail silently. `.lingering` keeps the model
+    // in memory between calls, so setup stays ~50-130 ms.
+    let analyzer = SpeechAnalyzer(
+        modules: [transcriber],
+        options: .init(priority: .userInitiated, modelRetention: .lingering))
     do {
+        try await analyzer.prepareToAnalyze(in: targetFormat)
+        // Biases recognition toward the user's custom words (DictationTranscriber
+        // only; Apple caps it at ~100 short phrases).
+        if !contextWords.isEmpty {
+            let context = AnalysisContext()
+            context.contextualStrings[.general] = Array(contextWords.prefix(100))
+            try await analyzer.setContext(context)
+        }
         try await analyzer.start(inputSequence: stream)
         try await analyzer.finalizeAndFinishThroughEndOfInput()
     } catch {
@@ -220,9 +270,11 @@ public func appleSpeechTranscribe(
     _ samples: UnsafePointer<Float>?,
     _ count: Int,
     _ sampleRate: Int32,
-    _ language: UnsafePointer<CChar>
+    _ language: UnsafePointer<CChar>,
+    _ contextWords: UnsafePointer<CChar>
 ) -> UnsafeMutablePointer<AppleSpeechResponse> {
     let code = String(cString: language)
+    let words = String(cString: contextWords).split(separator: "\n").map(String.init)
     guard #available(macOS 26.0, *) else {
         return makeResponse(.failure(BridgeError(message: "Apple Speech requires macOS 26 or later")))
     }
@@ -231,7 +283,7 @@ public func appleSpeechTranscribe(
     }
     let copy = Array(UnsafeBufferPointer(start: samples, count: count))
     return makeResponse(blocking {
-        try await transcribe(copy, sampleRate: Double(sampleRate), code: code)
+        try await transcribe(copy, sampleRate: Double(sampleRate), code: code, contextWords: words)
     })
 }
 

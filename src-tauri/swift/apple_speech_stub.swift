@@ -31,7 +31,8 @@ public func appleSpeechTranscribe(
     _ samples: UnsafePointer<Float>?,
     _ count: Int,
     _ sampleRate: Int32,
-    _ language: UnsafePointer<CChar>
+    _ language: UnsafePointer<CChar>,
+    _ contextWords: UnsafePointer<CChar>
 ) -> UnsafeMutablePointer<AppleSpeechResponse> {
     return unavailable()
 }
